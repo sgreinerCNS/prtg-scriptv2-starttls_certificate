@@ -1,0 +1,16 @@
+[project]
+name = "scriptv2-sensors"
+version = "1.0.0"
+description = "Paessler PRTG Scripts v2 sensors collection"
+readme = "README.md"
+authors = [
+    { name = "Andreas Strobl", email = "astroblx@asgraphics.at" }
+]
+requires-python = ">=3.13"
+dependencies = [
+    "certifi>=2025.4.26",
+    "cryptography>=45.0.2",
+]
+
+[tool.ruff]
+line-length = 100
