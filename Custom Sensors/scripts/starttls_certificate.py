@@ -32,7 +32,7 @@ import ssl
 import sys
 import certifi
 from cryptography import x509
-from cryptography.x509.oid import ExtensionOID
+from cryptography.x509.oid import ExtensionOID, NameOID
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import rsa
 
@@ -400,7 +400,7 @@ def load_ca_trust_certificates(ca_trust_file: str | None=None) -> list:
             pass
     sys.stderr = _stderr
     return ca_certs
-          
+
 def load_system_ca_trust_certificates() -> list:
     """Loads trusted CA certs from the system's CA trust store.
 
@@ -432,7 +432,7 @@ def load_system_ca_trust_certificates() -> list:
             pass
     sys.stderr = _stderr
     return ca_certs
-          
+
 def read_x509_certificate_san_extension_dnsnames(cert: x509.Certificate) -> list:
     """Reads the DNSName values of the cert's subjectAltName extension.
 
@@ -462,11 +462,10 @@ def read_x509_certificate_common_name(cert: x509.Certificate) -> str:
     :rtype: str
     """
 
-    common_name = list(filter(
-        lambda x: 'cn=' in x.lower().strip(),
-        cert.subject.rfc4514_string().split(',')
-    ))[0].split('=')[1].lower().strip()
-    return common_name
+    cn_attributes = cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)
+    if cn_attributes:
+        return cn_attributes[0].value.lower().strip()
+    return ''
 
 def read_x509_certificate_fingerprint(cert: x509.Certificate) -> str:
     """Reads the certificate's SHA1 fingerprint.
@@ -476,7 +475,7 @@ def read_x509_certificate_fingerprint(cert: x509.Certificate) -> str:
     :return: The certificate's SHA1 fingerprint in all caps letters.
     :rtype: str
     """
-    
+
     fingerprint = cert.fingerprint(hashes.SHA1()).hex().upper()
     return fingerprint
 
