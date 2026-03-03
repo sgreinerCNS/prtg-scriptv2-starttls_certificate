@@ -503,6 +503,36 @@ def read_x509_certificate_fingerprint(cert: x509.Certificate) -> str:
     fingerprint = cert.fingerprint(hashes.SHA1()).hex().upper()
     return fingerprint
 
+def match_hostname_wildcard(pattern: str, hostname: str) -> bool:
+    """Checks if a hostname matches a certificate name pattern, supporting wildcards.
+
+    Supports RFC 6125 wildcard matching: a single '*' in the leftmost label
+    matches exactly one label level (e.g. '*.example.com' matches
+    'mx.example.com' but not 'a.b.example.com').
+
+    :param pattern: Certificate CN or SAN value (e.g. '*.example.com').
+    :type pattern: str
+    :param hostname: The hostname to check against the pattern.
+    :type hostname: str
+    :return: True if the hostname matches the pattern.
+    :rtype: bool
+    """
+
+    pattern = pattern.lower().strip()
+    hostname = hostname.lower().strip()
+    if pattern == hostname:
+        return True
+    # Wildcard matching: only a leading '*.' is supported and it matches exactly one label
+    if pattern.startswith('*.') and pattern.count('*') == 1:
+        # The wildcard suffix (e.g. '.example.com')
+        wildcard_suffix = pattern[1:]  # e.g. '.example.com'
+        # hostname must end with the suffix and the part before must be a single label (no dots)
+        if hostname.endswith(wildcard_suffix):
+            prefix = hostname[:-len(wildcard_suffix)]
+            if prefix and '.' not in prefix:
+                return True
+    return False
+
 def validate_certificate_public_key_length(cert: x509.Certificate) -> tuple[int, str]:
     """Validates the public key length of the certificate.
 
@@ -551,14 +581,15 @@ def validate_certificate_common_name(cert: x509.Certificate,
 
     match validation_method:
         case 'CN':
-            if common_name == sni_domain:
+            if match_hostname_wildcard(common_name, sni_domain):
                 check_result = 0
             else:
                 check_result = 1
         case 'CN/SAN':
-            # CN/SAN validation
+            # CN/SAN validation (supports wildcard certificates)
             dns_names = read_x509_certificate_san_extension_dnsnames(cert)
-            if common_name == sni_domain or sni_domain in dns_names:
+            if match_hostname_wildcard(common_name, sni_domain) or \
+                    any(match_hostname_wildcard(san, sni_domain) for san in dns_names):
                 check_result = 5
             else:
                 check_result = 6
