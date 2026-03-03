@@ -29,6 +29,7 @@ import os
 import shlex
 import socket
 import ssl
+import _ssl
 import sys
 import certifi
 from cryptography import x509
@@ -144,7 +145,7 @@ def work(args: argparse.Namespace) -> dict:
         if args.sni_domain:
             server_hostname = args.sni_domain[0]
 
-        cert, conn = load_der_x509_certificate(conn, server_hostname)
+        cert, peer_intermediates, conn = load_der_x509_certificate(conn, server_hostname)
         disconnect(conn, args.protocol)
 
         if cert is None:
@@ -169,6 +170,7 @@ def work(args: argparse.Namespace) -> dict:
         result['message'] = ' - '.join(_message_parts)
         channels = validate_certificate(cert,
                                         server_hostname,
+                                        peer_chain=peer_intermediates,
                                         name_validation=name_validation,
                                         ca_trust=ca_trust,
                                         system_ca_trust=args.system_ca_trust)
@@ -236,15 +238,20 @@ def connect(host: str, port: int, protocol: str) -> socket.socket:
     return s
 
 def load_der_x509_certificate(connection: socket.socket,
-                              sni_domain: str) -> tuple[x509.Certificate | None, ssl.SSLSocket]:
-    """Reads the peer's binary certificate data and returns certificate and SSLSocket.
+                              sni_domain: str
+    ) -> tuple[x509.Certificate | None, list[x509.Certificate], ssl.SSLSocket]:
+    """Reads the peer's binary certificate data and returns certificate, intermediates, and SSLSocket.
+
+    Extracts the full certificate chain sent by the server during the TLS handshake.
+    The first certificate (leaf) is returned separately, remaining certificates are
+    returned as a list of intermediate certificates for chain building.
 
     :param connection: Connection with STARTTLS prepared and ready to communicate encrypted.
     :type connection: ssl.SSLSocket
     :param sni_domain: Server hostname if the device has multiple certificates on the same IP address.
     :type sni_domain: str
-    :return: Tuple of certificate or None and the prepared SSL socket.
-    :rtype: tuple[x509.Certificate | None, ssl.SSLSocket]
+    :return: Tuple of leaf certificate (or None), list of intermediate certificates, and SSL socket.
+    :rtype: tuple[x509.Certificate | None, list[x509.Certificate], ssl.SSLSocket]
     """
 
     # Create a custom context based on TLS_CLIENT
@@ -252,15 +259,28 @@ def load_der_x509_certificate(connection: socket.socket,
     ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
     ctx.check_hostname = False
     ctx.verify_mode = ssl.CERT_NONE
+    peer_intermediates = []
     try:
         sslsocket = ctx.wrap_socket(connection, server_hostname=sni_domain)
         cert_der_data = sslsocket.getpeercert(binary_form=True)
         if cert_der_data is None:
             raise ValueError(f'Host "{sni_domain}" did not provide certificate.')
         cert = x509.load_der_x509_certificate(cert_der_data)
+        # Extract intermediate certificates from the TLS handshake chain
+        # get_unverified_chain() returns the full chain as sent by the server:
+        # index 0 is the leaf, index 1..n are intermediates
+        try:
+            chain = sslsocket._sslobj.get_unverified_chain()
+            if chain and len(chain) > 1:
+                for chain_cert in chain[1:]:
+                    peer_intermediates.append(
+                        x509.load_der_x509_certificate(
+                            chain_cert.public_bytes(_ssl.ENCODING_DER)))
+        except AttributeError:
+            pass
     except ssl.SSLError | ValueError:
         cert = None
-    return cert, sslsocket
+    return cert, peer_intermediates, sslsocket
 
 def disconnect(connection: ssl.SSLSocket, protocol: str) -> None:
     """Closes an established connection (socket) with the proper protocol commands.
@@ -281,6 +301,7 @@ def disconnect(connection: ssl.SSLSocket, protocol: str) -> None:
 
 def validate_certificate(cert: x509.Certificate,
                          sni_domain: str,
+                         peer_chain: list | None=None,
                          name_validation: str | None=None,
                          ca_trust: str | None=None,
                          system_ca_trust: bool=False) -> list:
@@ -294,6 +315,8 @@ def validate_certificate(cert: x509.Certificate,
     :type cert: x509.Certificate
     :param sni_domain: Server hostname.
     :type sni_domain: str
+    :param peer_chain: Intermediate certificates from the TLS handshake.
+    :type peer_chain: list, optional
     :param name_validation: Method how to validate the server hostname (CN, CN/SAN)
     :type name_validation: str, optional
     :param ca_trust: File of trusted CA certs in PEM format.
@@ -317,6 +340,7 @@ def validate_certificate(cert: x509.Certificate,
     # Channel 13 (3): Root Authority Trusted
     # 0 - trusted, 1 - not trusted
     _check_value = validate_certificate_path(cert, sni_domain,
+                                             peer_chain=peer_chain,
                                              ca_trust=ca_trust,
                                              system_ca_trust=system_ca_trust)
     channels.append({
@@ -542,14 +566,20 @@ def validate_certificate_common_name(cert: x509.Certificate,
 
 def validate_certificate_path(cert: x509.Certificate,
                               sni_hostname: str,
+                              peer_chain: list | None=None,
                               ca_trust: str | None=None,
                               system_ca_trust: bool=False) -> int:
     """Validates the path of a certificate
+
+    Uses the intermediate certificates sent by the server during the TLS handshake
+    (peer_chain) to build the certificate chain from leaf to a trusted root CA.
 
     :param cert: The certificate to validate.
     :type cert: x509.Certificate
     :param sni_hostname: SNI hostname
     :type sni_hostname: str
+    :param peer_chain: Intermediate certificates from the TLS handshake.
+    :type peer_chain: list, optional
     :param ca_trust: Path to file of trusted intermediate CA certificates in PEM format, default: None
     :type ca_trust: str, optional
     :param system_ca_trust: Use the CA certificates of the system's certificate store.
@@ -559,13 +589,17 @@ def validate_certificate_path(cert: x509.Certificate,
     """
 
     validation_result = 1
-    intermediate_ca_certs = []
+    # Start with intermediates from the TLS handshake (server-provided chain)
+    intermediate_ca_certs = list(peer_chain) if peer_chain else []
 
     if system_ca_trust:
         root_ca_certs = load_system_ca_trust_certificates()
     else:
         root_ca_certs = load_ca_trust_certificates()
-        intermediate_ca_certs = load_ca_trust_certificates(ca_trust_file=ca_trust)
+        # Extend with user-provided CA trust file if specified
+        if ca_trust:
+            intermediate_ca_certs.extend(
+                load_ca_trust_certificates(ca_trust_file=ca_trust))
     root_ca_store = x509.verification.Store(root_ca_certs)
 
     _verification_time = datetime.datetime.now(datetime.timezone.utc)
